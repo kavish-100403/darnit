@@ -5,7 +5,7 @@ description = "Generic compliance audit framework with plugin architecture"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.22.0",
+    "mcp>=1.23.0",  # CVE-2025-66416 DNS rebinding fix
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
     "pydantic[email]>=2.0.0",
@@ -15,6 +15,7 @@ dependencies = [
 attestation = [
     "sigstore>=3.0.0",
     "in-toto-attestation>=0.9.0",
+    "urllib3>=2.6.3",  # CVE-2025-66471, CVE-2026-21441, CVE-2025-66418 fixes
 ]
 
 [build-system]
