@@ -1,6 +1,9 @@
+import logging
+
 import pytest
-from darnit.core.logging import get_logger, configure_logging
-import logging 
+
+from darnit.core.logging import configure_logging, get_logger
+
 
 @pytest.mark.unit
 class TestGetLogger:
