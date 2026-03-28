@@ -187,8 +187,13 @@ class FileBackend(StorageBackend):
         self.base_dir = Path(base_dir)
 
     def _repo_slug(self, repo_url: str) -> str:
-        """Convert a repo URL to a safe directory name."""
-        return repo_url.replace("https://", "").replace("http://", "").replace("/", "_")
+        """Convert a repo URL to a safe directory name.
+
+        Uses double underscore as separator to avoid collisions between
+        org/repo and org_repo — e.g. github.com/org/repo becomes
+        github.com__org__repo.
+        """
+        return repo_url.replace("https://", "").replace("http://", "").replace("/", "__")
 
     def _ensure_dir(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
@@ -288,6 +293,8 @@ class ArchivistaBackend(StorageBackend):
     def __init__(self, archivista_url: str = "http://localhost:8082", base_dir: str = ".darnit") -> None:
         self.archivista_url = archivista_url.rstrip("/")
         self._file_fallback = FileBackend(base_dir=base_dir)
+        # Maps repo_url+commit -> gitoid for later retrieval
+        self._gitoid_index: dict[str, str] = {}
 
     def store_attestation(self, repo_url: str, commit: str, attestation: dict[str, Any]) -> str | None:
         try:
@@ -303,6 +310,7 @@ class ArchivistaBackend(StorageBackend):
                 body = resp.read().decode("utf-8")
                 data = json.loads(body)
                 gitoid = data.get("gitoid", "unknown")
+                self._gitoid_index[f"{repo_url}@{commit}"] = gitoid
                 logger.info(f"Stored attestation in Archivista for {repo_url}@{commit[:8]}, gitoid={gitoid}")
                 return f"{self.archivista_url}/download/{gitoid}"
         except Exception as e:
@@ -310,8 +318,15 @@ class ArchivistaBackend(StorageBackend):
             return self._file_fallback.store_attestation(repo_url, commit, attestation)
 
     def retrieve_attestation(self, repo_url: str, commit: str) -> dict[str, Any] | None:
-        # Without a gitoid we can't retrieve directly — fall back to file
-        logger.warning("Archivista retrieval requires a gitoid — falling back to file storage")
+        gitoid = self._gitoid_index.get(f"{repo_url}@{commit}")
+        if gitoid:
+            try:
+                import urllib.request
+                url = f"{self.archivista_url}/download/{gitoid}"
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                logger.error(f"Archivista retrieval failed: {e}, falling back to file storage")
         return self._file_fallback.retrieve_attestation(repo_url, commit)
 
     def store_metadata(self, repo_url: str, metadata: dict[str, Any]) -> bool:

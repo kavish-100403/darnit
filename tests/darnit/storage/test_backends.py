@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from darnit.storage.backends import (
     ArchivistaBackend,
     FileBackend,
@@ -30,7 +32,7 @@ SAMPLE_RESULT = {
 REPO_URL = "https://github.com/org/repo"
 COMMIT = "abc123def456"
 
-
+@pytest.mark.unit
 class TestMemoryBackend:
     """Tests for MemoryBackend — simplest to test, no filesystem."""
 
@@ -80,7 +82,7 @@ class TestMemoryBackend:
         assert self.backend.retrieve_metadata(REPO_URL)["name"] == "repo1"
         assert self.backend.retrieve_metadata(repo2)["name"] == "repo2"
 
-
+@pytest.mark.unit
 class TestFileBackend:
     """Tests for FileBackend — uses tmp_path, no real filesystem pollution."""
 
@@ -135,7 +137,15 @@ class TestFileBackend:
         assert backend.retrieve_attestation(REPO_URL, "commit1") == {"data": "first"}
         assert backend.retrieve_attestation(REPO_URL, "commit2") == {"data": "second"}
 
+    def test_repo_slug_no_collision_between_slash_and_underscore(self, tmp_path: Path) -> None:
+        """org/repo and org_repo should produce different slugs."""
+        backend = FileBackend(base_dir=str(tmp_path / ".darnit"))
+        backend.store_metadata("https://github.com/org/repo", {"name": "slash"})
+        backend.store_metadata("https://github.com/org_repo", {"name": "underscore"})
+        assert backend.retrieve_metadata("https://github.com/org/repo")["name"] == "slash"
+        assert backend.retrieve_metadata("https://github.com/org_repo")["name"] == "underscore"
 
+@pytest.mark.unit
 class TestArchivistaBackend:
     """Tests for ArchivistaBackend.
 
@@ -173,7 +183,7 @@ class TestArchivistaBackend:
         result = backend.retrieve_research_result(REPO_URL, COMMIT)
         assert result == SAMPLE_RESULT
 
-
+@pytest.mark.unit
 class TestGetBackendFactory:
     """Tests for the get_backend() factory function."""
 
