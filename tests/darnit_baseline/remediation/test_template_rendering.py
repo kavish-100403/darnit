@@ -373,3 +373,69 @@ class TestLLMEnhancement:
         assert is_enhanceable("SUPPORT.md") is False
         assert is_enhanceable("LICENSE") is False
         assert is_enhanceable("CONTRIBUTING.md") is False
+
+
+# =============================================================================
+# Template fallback defaults tests
+# =============================================================================
+
+
+class TestTemplateFallbackDefaults:
+    """Verify templates render sensible defaults when context is missing."""
+
+    def test_security_policy_fallback_contact(self, tmp_path):
+        """Security policy renders placeholder email when no contact set."""
+        rendered = _render_template("security_policy_standard", tmp_path)
+
+        # Should have the fallback, not a raw variable or empty string
+        assert "security@example.com" in rendered
+        assert "${context.security_contact}" not in rendered
+
+    def test_security_policy_minimal_fallback_contact(self, tmp_path):
+        """Minimal security policy renders placeholder email when no contact set."""
+        rendered = _render_template("security_policy_minimal", tmp_path)
+
+        assert "security@example.com" in rendered
+        assert "${context.security_contact}" not in rendered
+
+    def test_codeowners_fallback(self, tmp_path):
+        """CODEOWNERS renders a valid placeholder when no maintainers set."""
+        rendered = _render_template("codeowners_template", tmp_path)
+
+        # Should contain a valid CODEOWNERS entry, not an empty "* "
+        assert "@org/maintainers" in rendered
+        assert "${context.maintainers}" not in rendered
+
+    def test_maintainers_fallback(self, tmp_path):
+        """MAINTAINERS.md renders a placeholder when no maintainers set."""
+        rendered = _render_template("maintainers_template", tmp_path)
+
+        assert "@username" in rendered
+        assert "${context.maintainers}" not in rendered
+
+    def test_governance_fallback_links(self, tmp_path):
+        """Governance renders default links when scan context is empty."""
+        rendered = _render_template("governance_template", tmp_path)
+
+        # Should have fallback links, not raw variables
+        assert "CODE_OF_CONDUCT.md" in rendered
+        assert "SECURITY.md" in rendered
+        assert "${scan.code_of_conduct_link}" not in rendered
+        assert "${scan.security_policy_link}" not in rendered
+
+    def test_architecture_fallback_hint(self, tmp_path):
+        """Architecture renders a hint when no directory tree detected."""
+        # Empty repo — no directories to detect
+        rendered = _render_template("architecture_template", tmp_path)
+
+        # Should not contain raw template variable
+        assert "${scan.directory_tree}" not in rendered
+
+    def test_test_requirements_fallback_commands(self, tmp_path):
+        """Test requirements renders generic commands when no language detected."""
+        rendered = _render_template("test_requirements_contributing", tmp_path)
+
+        # Should not contain raw template variable
+        assert "${scan.test_commands_all}" not in rendered
+        # Should have some test command hint
+        assert "test" in rendered.lower()
