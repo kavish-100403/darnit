@@ -329,6 +329,7 @@ presentation_hint = "[y/N]"
 type = "boolean"
 prompt = "Does this project make official releases?"
 hint = "Set to true if you publish versioned releases"
+no_detect_hint = "No releases, version tags, or release workflows were found in the repository. Do you plan to publish versioned releases in the future? Release-related controls will be marked N/A if set to false."
 examples = ["true", "false"]
 affects = ["OSPS-BR-02.01", "OSPS-BR-03.01", "OSPS-BR-04.01"]
 store_as = "build.has_releases"
@@ -339,7 +340,7 @@ detect = [
     { handler = "file_exists", files = [".github/workflows/release*"], value_if_pass = true },
     { handler = "file_exists", files = ["CHANGELOG.md", "CHANGELOG", "CHANGES.md", "CHANGES"], value_if_pass = true },
     { handler = "exec", command = ["git", "tag", "--list", "v*"], pass_exit_codes = [0], expr = 'output.stdout != ""', value_if_pass = true },
-    { handler = "exec", command = ["gh", "release", "list", "--repo", "$OWNER/$REPO", "--limit", "1"], pass_exit_codes = [0], value_if_pass = true, value_if_fail = false },
+    { handler = "exec", command = ["gh", "release", "list", "--repo", "$OWNER/$REPO", "--limit", "1"], pass_exit_codes = [0], expr = 'output.stdout != ""', value_if_pass = true, value_if_fail = false },
 ]
 
 [context.is_library]

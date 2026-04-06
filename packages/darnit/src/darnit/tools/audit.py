@@ -525,7 +525,15 @@ def run_sieve_audit(
         sieve_result = orchestrator.verify(spec, context)
 
         # Convert to legacy dict format
-        all_results.append(sieve_result.to_legacy_dict())
+        result_dict = sieve_result.to_legacy_dict()
+
+        # Attach when clause metadata so the formatter can hint about
+        # controls that may become N/A once project context is confirmed.
+        when_clause = spec.metadata.get("when")
+        if when_clause:
+            result_dict["when"] = when_clause
+
+        all_results.append(result_dict)
 
     summary = summarize_results(all_results)
 
@@ -785,6 +793,27 @@ def format_results_markdown(
                         if len(help_lines) > 10:
                             lines.append("  > *(truncated)*")
                         lines.append("")
+
+                # Hint when FAIL/WARN controls have when clauses with boolean
+                # conditions (e.g. has_releases=true) that might make the
+                # control N/A once the user confirms project context.
+                if status in ("FAIL", "WARN"):
+                    when_clause = r.get("when")
+                    if when_clause and isinstance(when_clause, dict):
+                        # Only surface boolean-true conditions — these are the
+                        # ones where the user answering "no" would flip the
+                        # control to N/A.  Keys like platform="github" are
+                        # auto-detected and not actionable here.
+                        actionable_keys = [
+                            k for k, v in when_clause.items()
+                            if v is True
+                        ]
+                        if actionable_keys:
+                            keys_str = ", ".join(f"`{k}`" for k in actionable_keys)
+                            lines.append(
+                                f"  - *💡 This control requires {keys_str}. "
+                                "It may become N/A after confirming project context.*"
+                            )
 
                 # Task 8.1: Show unmet when conditions for N/A controls
                 if status == "N/A":
