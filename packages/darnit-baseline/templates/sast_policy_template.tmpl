@@ -16,7 +16,7 @@
 
 ## Tools
 
-SAST scanning is performed by ${scan.ci_sast_tools|CodeQL}. See
+SAST scanning is performed by << scan.ci_sast_tools | default('CodeQL') >>. See
 [`.github/workflows/sast.yml`](../.github/workflows/sast.yml) for configuration.
 
 ## Exception Process

@@ -78,11 +78,38 @@ class TestRemediationExecutor:
             default_branch="main",
         )
 
-        text = "Contact security@$OWNER.github.io for $REPO issues"
+        text = "Contact security@<< OWNER >>.github.io for << REPO >> issues"
         result = executor._substitute(text, "TEST-01")
 
         assert "security@myorg.github.io" in result
         assert "myrepo issues" in result
+
+    def test_github_actions_expressions_preserved(self):
+        """Test that GitHub Actions ${{ }} expressions pass through untouched."""
+        executor = RemediationExecutor(
+            local_path="/tmp/test",
+            owner="myorg",
+            repo="myrepo",
+        )
+
+        text = "artifact-name: sbom-${{ github.event.release.tag_name || 'snapshot' }}.spdx.json"
+        result = executor._substitute(text, "TEST-01")
+
+        assert "${{ github.event.release.tag_name || 'snapshot' }}" in result
+
+    def test_shell_vars_preserved(self):
+        """Test that shell $VAR expressions pass through untouched."""
+        executor = RemediationExecutor(
+            local_path="/tmp/test",
+            owner="myorg",
+            repo="myrepo",
+        )
+
+        text = "echo $HOME and $PATH should not be substituted"
+        result = executor._substitute(text, "TEST-01")
+
+        assert "$HOME" in result
+        assert "$PATH" in result
 
     def test_context_list_substitution_uses_spaces(self):
         """Test that list context values are joined with spaces (not commas).
@@ -98,7 +125,7 @@ class TestRemediationExecutor:
             "maintainers": ["@alice", "@bob", "@charlie"],
         }
 
-        text = "* ${context.maintainers}"
+        text = "* << context.maintainers >>"
         result = executor._substitute(text, "TEST-01")
 
         assert result == "* @alice @bob @charlie"
@@ -112,7 +139,7 @@ class TestRemediationExecutor:
             default_branch="main",
         )
 
-        command = ["gh", "api", "/repos/$OWNER/$REPO/branches/$BRANCH"]
+        command = ["gh", "api", "/repos/<< OWNER >>/<< REPO >>/branches/<< BRANCH >>"]
         result = executor._substitute_command(command, "TEST-01")
 
         assert result == ["gh", "api", "/repos/testorg/testrepo/branches/main"]

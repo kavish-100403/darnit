@@ -32,7 +32,7 @@ class TestScanVarSubstitution:
             },
         )
         result = executor._substitute(
-            "Run tests with: ${scan.test_command}", "OSPS-TEST-01"
+            "Run tests with: << scan.test_command >>", "OSPS-TEST-01"
         )
         assert result == "Run tests with: uv run pytest"
 
@@ -44,7 +44,7 @@ class TestScanVarSubstitution:
             scan_values={},
         )
         result = executor._substitute(
-            "Tool: ${scan.missing_var}", "OSPS-TEST-01"
+            "Tool: << scan.missing_var >>", "OSPS-TEST-01"
         )
         assert result == "Tool: "
 
