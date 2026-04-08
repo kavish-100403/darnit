@@ -411,6 +411,9 @@ class RemediationExecutor:
         # Assemble flat context for when-clause evaluation
         when_context: dict[str, Any] = dict(self._project_values)
         when_context.update(self._context_values)
+        # Include scan values so when-clauses can match on detected CI tools
+        # (e.g., scan.ci_sast_tools, scan.ci_sca_tools)
+        when_context.update(self._scan_values)
 
         results: list[dict[str, Any]] = []
         all_success = True

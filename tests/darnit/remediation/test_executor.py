@@ -510,6 +510,74 @@ class TestExecutorWhenClause:
             assert result.success
 
 
+class TestScanValuesInWhenContext:
+    """Test that scan_values are available for when-clause matching."""
+
+    def test_scan_values_match_when_clause(self):
+        """Scan values (e.g., scan.app_kusari_inspector) should be usable in when clauses."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = RemediationExecutor(
+                local_path=tmpdir,
+                owner="testorg",
+                repo="testrepo",
+                scan_values={"scan.app_kusari_inspector": "true"},
+            )
+
+            config = RemediationConfig(
+                strategy="first_match",
+                handlers=[
+                    HandlerInvocation(
+                        handler="manual",
+                        steps=["Kusari Inspector handles this"],
+                        when={"scan.app_kusari_inspector": "true"},
+                    ),
+                    HandlerInvocation(
+                        handler="file_create",
+                        path="sast.yml",
+                        content="# CodeQL fallback",
+                    ),
+                ],
+            )
+
+            result = executor.execute("TEST-01", config, dry_run=True)
+            assert result.success
+            handlers = result.details["handlers"]
+            assert len(handlers) == 1
+            assert handlers[0]["handler"] == "manual"
+
+    def test_scan_values_fallback_when_not_present(self):
+        """Without scan values, when clause doesn't match and falls through to default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = RemediationExecutor(
+                local_path=tmpdir,
+                owner="testorg",
+                repo="testrepo",
+                scan_values={},
+            )
+
+            config = RemediationConfig(
+                strategy="first_match",
+                handlers=[
+                    HandlerInvocation(
+                        handler="manual",
+                        steps=["Kusari Inspector handles this"],
+                        when={"scan.app_kusari_inspector": "true"},
+                    ),
+                    HandlerInvocation(
+                        handler="file_create",
+                        path="sast.yml",
+                        content="# CodeQL fallback",
+                    ),
+                ],
+            )
+
+            result = executor.execute("TEST-01", config, dry_run=True)
+            assert result.success
+            handlers = result.details["handlers"]
+            assert len(handlers) == 1
+            assert handlers[0]["handler"] == "file_create"
+
+
 class TestWhenFieldNotInHandlerConfig:
     """Test that 'when' is a Pydantic explicit field, not model_extra."""
 

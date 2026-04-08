@@ -3218,7 +3218,19 @@ steps = [
 [controls."OSPS-VM-05.02".remediation]
 safe = true
 dry_run_supported = true
+strategy = "first_match"
 
+# When Kusari Inspector is installed, it handles SCA — no workflow needed
+[[controls."OSPS-VM-05.02".remediation.handlers]]
+handler = "manual"
+when = { "scan.app_kusari_inspector" = "true" }
+steps = [
+    "Kusari Inspector is installed and provides SCA scanning",
+    "Verify Kusari Inspector is configured for this repository at https://console.us.kusari.cloud/",
+    "No additional workflow file is needed — Kusari Inspector runs as a GitHub App",
+]
+
+# Default: create a dependency-review workflow when no SCA tool is detected
 [[controls."OSPS-VM-05.02".remediation.handlers]]
 handler = "file_create"
 path = ".github/workflows/sca.yml"
@@ -3390,7 +3402,7 @@ handler = "pattern"
 files = [".github/workflows/*.yml", ".github/workflows/*.yaml"]
 
 [controls."OSPS-VM-06.02".passes.pattern.patterns]
-sast_tool = "(codeql|semgrep|sonar|bandit|gosec|brakeman)"
+sast_tool = "(codeql|semgrep|sonar|bandit|gosec|brakeman|kusari)"
 
 [[controls."OSPS-VM-06.02".passes]]
 handler = "manual"
@@ -3403,7 +3415,19 @@ steps = [
 [controls."OSPS-VM-06.02".remediation]
 safe = true
 dry_run_supported = true
+strategy = "first_match"
 
+# When Kusari Inspector is installed, it handles SAST — no workflow needed
+[[controls."OSPS-VM-06.02".remediation.handlers]]
+handler = "manual"
+when = { "scan.app_kusari_inspector" = "true" }
+steps = [
+    "Kusari Inspector is installed and provides SAST scanning",
+    "Verify Kusari Inspector is configured for this repository at https://console.us.kusari.cloud/",
+    "No additional workflow file is needed — Kusari Inspector runs as a GitHub App",
+]
+
+# Default: create a CodeQL workflow when no SAST tool is detected
 [[controls."OSPS-VM-06.02".remediation.handlers]]
 handler = "file_create"
 path = ".github/workflows/sast.yml"

@@ -733,4 +733,11 @@ def flatten_scan_context(ctx: RepoScanContext) -> dict[str, str]:
                 elif not existing:
                     result[key] = app_name
 
+            # Emit per-app boolean flags for when-clause matching.
+            # Allows TOML when = { "scan.app_kusari_inspector" = "true" }
+            # without depending on exact ci_*_tools string formatting.
+            slug = app.get("slug", "")
+            if slug:
+                result[f"scan.app_{slug.replace('-', '_')}"] = "true"
+
     return result
