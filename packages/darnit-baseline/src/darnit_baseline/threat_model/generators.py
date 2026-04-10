@@ -175,6 +175,11 @@ def _render_threat_detailed(threat: Threat) -> list[str]:
         md.append("**Code Locations:**")
         for cl in threat.code_locations[:3]:
             md.append(f"- `{cl.file}:{cl.line_start}` - {cl.annotation}")
+            if cl.snippet:
+                md.append("")
+                md.append("```python")
+                md.append(cl.snippet)
+                md.append("```")
         md.append("")
 
     # Ranked controls (new, preferred over recommended_controls)

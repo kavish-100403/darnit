@@ -932,6 +932,8 @@ def generate_threat_model(
     repo = repo or detected_repo
 
     try:
+        from darnit_baseline.threat_model.stride import enrich_threats_with_code_context
+
         # Detect frameworks
         frameworks = detect_frameworks(str(repo_path))
 
@@ -943,6 +945,9 @@ def generate_threat_model(
 
         # Analyze threats
         threats = analyze_stride_threats(assets, injection_sinks)
+
+        # Enrich threats with actual source code context for LLM verification
+        enrich_threats_with_code_context(threats, str(repo_path))
 
         # Detect attack chains
         attack_chains = detect_attack_chains(threats, assets)
@@ -962,16 +967,70 @@ def generate_threat_model(
         else:
             content = generate_markdown_threat_model(str(repo_path), assets, threats, control_gaps, frameworks, detail_level, attack_chains)
 
+        # Build LLM verification section for pattern-matched threats
+        verification_section = _build_verification_section(threats)
+
         # Write to disk if output_path provided
         if output_path:
             target = repo_path / output_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-            return f"Threat model written to {output_path} ({len(content)} bytes)"
+            msg = f"Threat model written to {output_path} ({len(content)} bytes)"
+            if verification_section:
+                msg += "\n\n" + verification_section
+            return msg
 
+        if verification_section:
+            content += "\n\n" + verification_section
         return content
     except Exception as e:
         return f"❌ Error generating threat model: {e}"
+
+
+def _build_verification_section(threats: list) -> str:
+    """Build an LLM verification prompt for pattern-matched threats.
+
+    Returns a section asking the calling LLM to review each threat
+    with its actual code context and confirm whether it is a real
+    finding or a false positive.
+    """
+    if not threats:
+        return ""
+
+    lines = [
+        "---",
+        "",
+        "## 🔍 LLM Verification Required",
+        "",
+        "The following threats were identified by pattern matching and require",
+        "your review. For each finding, examine the code context and determine",
+        "whether it represents a **real security concern** or a **false positive**.",
+        "",
+        "Remove any false positives from the threat model before committing.",
+        "",
+    ]
+
+    for threat in threats:
+        lines.append(f"### {threat.id}: {threat.title}")
+        lines.append("")
+        lines.append(f"**Category:** {threat.category.value.replace('_', ' ').title()}")
+        lines.append(f"**Risk:** {threat.risk.overall:.2f} ({threat.risk.level.value.upper()})")
+        lines.append(f"**Description:** {threat.description}")
+        lines.append("")
+
+        for cl in threat.code_locations[:3]:
+            lines.append(f"**`{cl.file}:{cl.line_start}`** — {cl.annotation}")
+            if cl.snippet:
+                lines.append("```python")
+                lines.append(cl.snippet)
+                lines.append("```")
+            lines.append("")
+
+        lines.append("**Verify:** Is user-controlled data actually reaching this code path? "
+                      "Is the flagged pattern a genuine security risk in this context?")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def generate_attestation(

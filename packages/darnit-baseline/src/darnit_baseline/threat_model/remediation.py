@@ -109,9 +109,18 @@ def generate_threat_model_handler(
 
     return HandlerResult(
         status=HandlerResultStatus.PASS,
-        message=f"Generated dynamic threat model: {path}",
+        message=f"Generated dynamic threat model: {path} — LLM should verify findings against code context",
         confidence=1.0,
-        evidence={"path": path, "action": "created"},
+        evidence={
+            "path": path,
+            "action": "created",
+            "llm_verification_required": True,
+            "note": (
+                "Threat model contains pattern-matched findings with source code "
+                "context. Review each finding in the generated file and remove any "
+                "false positives before committing."
+            ),
+        },
     )
 
 
@@ -119,6 +128,8 @@ def _run_dynamic_analysis(repo_path: str) -> str:
     """Run the full STRIDE analysis pipeline and return Markdown content.
 
     This reuses the same analysis pipeline as the generate_threat_model MCP tool.
+    Threats are enriched with source code context so the calling LLM can
+    verify findings before committing the file.
 
     Args:
         repo_path: Absolute path to the repository
@@ -136,12 +147,20 @@ def _run_dynamic_analysis(repo_path: str) -> str:
         discover_injection_sinks,
     )
     from .generators import generate_markdown_threat_model
-    from .stride import analyze_stride_threats, identify_control_gaps
+    from .stride import (
+        analyze_stride_threats,
+        enrich_threats_with_code_context,
+        identify_control_gaps,
+    )
 
     frameworks = detect_frameworks(repo_path)
     assets = discover_all_assets(repo_path, frameworks)
     injection_sinks = discover_injection_sinks(repo_path)
     threats = analyze_stride_threats(assets, injection_sinks)
+
+    # Enrich threats with actual source code for LLM verification
+    enrich_threats_with_code_context(threats, repo_path)
+
     attack_chains = detect_attack_chains(threats, assets)
     control_gaps = identify_control_gaps(assets, threats)
 

@@ -87,6 +87,36 @@ def _line_is_string_or_comment(line: str) -> bool:
     return bool(re.match(r".*r['\"].*['\"]", stripped))
 
 
+def _get_docstring_lines(content: str) -> set[int]:
+    """Return set of 1-based line numbers that fall inside docstrings.
+
+    Uses the AST to find all string constants that are docstrings
+    (first expression in module/class/function body).
+    """
+    docstring_lines: set[int] = set()
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return docstring_lines
+
+    for node in ast.walk(tree):
+        # Docstrings are Expr nodes containing a Constant string as the
+        # first statement in a module, class, or function body.
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                doc_node = body[0].value
+                for line_no in range(doc_node.lineno, doc_node.end_lineno + 1):
+                    docstring_lines.add(line_no)
+
+    return docstring_lines
+
+
 def _match_is_in_string_context(content: str, match_start: int) -> bool:
     """Check whether a regex match position falls inside a string literal.
 
@@ -481,10 +511,19 @@ def discover_sensitive_data(local_path: str) -> list[SensitiveData]:
             except OSError:
                 continue
 
+            # For Python files, compute docstring line set to filter them out
+            docstring_lines: set[int] = set()
+            if filename.endswith('.py'):
+                docstring_lines = _get_docstring_lines(content)
+
             for data_type, config in SENSITIVE_DATA_PATTERNS.items():
                 for pattern in config["patterns"]:
                     for i, line in enumerate(lines):
+                        line_no = i + 1
                         if _line_is_string_or_comment(line):
+                            continue
+                        # Skip lines inside Python docstrings
+                        if line_no in docstring_lines:
                             continue
                         matches = re.findall(pattern, line, re.IGNORECASE)
                         for match in matches:
@@ -496,7 +535,7 @@ def discover_sensitive_data(local_path: str) -> list[SensitiveData]:
                                     data_type=data_type,
                                     field_name=field_name,
                                     file=rel_path,
-                                    line=i + 1,
+                                    line=line_no,
                                     context=line.strip()[:100]
                                 ))
 
@@ -724,6 +763,16 @@ def discover_injection_sinks(local_path: str) -> list[dict[str, Any]]:
                         if _line_is_string_or_comment(line):
                             continue
                         if re.search(pattern, line):
+                            # Check for user-input taint in surrounding context
+                            # (5 lines before and after the match)
+                            context_start = max(0, i - 5)
+                            context_end = min(len(lines), i + 6)
+                            context_window = "\n".join(lines[context_start:context_end])
+                            has_user_input = bool(re.search(
+                                r"request\.|req\.|params\[|query\[|input\(|argv"
+                                r"|form\[|body\[|headers\[|args\.",
+                                context_window,
+                            ))
                             sinks.append({
                                 "type": injection_type,
                                 "file": rel_path,
@@ -731,7 +780,8 @@ def discover_injection_sinks(local_path: str) -> list[dict[str, Any]]:
                                 "snippet": line.strip()[:100],
                                 "severity": config["severity"],
                                 "cwe": config["cwe"],
-                                "recommendation": config["recommendation"]
+                                "recommendation": config["recommendation"],
+                                "has_user_input": has_user_input,
                             })
 
     return sinks

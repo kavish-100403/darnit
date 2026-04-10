@@ -99,6 +99,7 @@ from .scenarios import (
 from .stride import (
     analyze_stride_threats,
     calculate_risk_score,
+    enrich_threats_with_code_context,
     identify_control_gaps,
 )
 
@@ -141,6 +142,7 @@ __all__ = [
     # Analysis
     "calculate_risk_score",
     "analyze_stride_threats",
+    "enrich_threats_with_code_context",
     "identify_control_gaps",
     # Scenarios
     "SCENARIO_TEMPLATES",

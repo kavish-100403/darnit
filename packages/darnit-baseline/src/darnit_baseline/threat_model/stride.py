@@ -9,6 +9,7 @@ This module implements the STRIDE methodology for threat analysis:
 - Elevation of Privilege
 """
 
+import os
 from typing import Any
 
 from darnit.core.logging import get_logger
@@ -25,6 +26,42 @@ from .models import (
 from .scenarios import get_scenario
 
 logger = get_logger("threat_model.stride")
+
+
+def enrich_threats_with_code_context(
+    threats: list[Threat],
+    repo_path: str,
+    context_lines: int = 5,
+) -> None:
+    """Read source code around each threat's code locations and populate snippets.
+
+    This gives LLM reviewers the actual code context needed to verify
+    whether a pattern-matched finding is a real threat or a false positive.
+
+    Args:
+        threats: List of threats to enrich (modified in place)
+        repo_path: Absolute path to the repository root
+        context_lines: Number of lines to include above and below the match
+    """
+    for threat in threats:
+        for cl in threat.code_locations:
+            if cl.snippet:
+                # Already has a snippet (e.g. from discovery)
+                continue
+            filepath = os.path.join(repo_path, cl.file)
+            try:
+                with open(filepath, errors="ignore") as f:
+                    all_lines = f.readlines()
+            except OSError:
+                continue
+
+            start = max(0, cl.line_start - context_lines - 1)
+            end = min(len(all_lines), cl.line_start + context_lines)
+            numbered = []
+            for idx in range(start, end):
+                marker = ">>>" if idx == cl.line_start - 1 else "   "
+                numbered.append(f"{marker} {idx + 1:4d} | {all_lines[idx].rstrip()}")
+            cl.snippet = "\n".join(numbered)
 
 
 def _apply_scenario(threat: Threat, sub_type: str) -> None:
@@ -228,8 +265,20 @@ def analyze_stride_threats(
             ))
             _apply_scenario(threats[-1], "server_action_no_auth")
 
-    # Analyze injection sinks
+    # Analyze injection sinks — only report when user input taint is detected
     for sink in injection_sinks:
+        has_user_input = sink.get("has_user_input", False)
+
+        # Skip sinks with no evidence of user-controlled data reaching them.
+        # These are overwhelmingly false positives (hardcoded URLs, internal
+        # calls) and reporting them erodes trust in the threat model.
+        if not has_user_input:
+            logger.debug(
+                "Skipping injection sink %s at %s:%d — no user-input taint detected",
+                sink["type"], sink["file"], sink["line"],
+            )
+            continue
+
         threat_id += 1
         category = StrideCategory.TAMPERING
         if sink["type"] == "xss":
@@ -525,5 +574,6 @@ def identify_control_gaps(
 __all__ = [
     "calculate_risk_score",
     "analyze_stride_threats",
+    "enrich_threats_with_code_context",
     "identify_control_gaps",
 ]

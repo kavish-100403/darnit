@@ -12,14 +12,17 @@ import pytest
 
 from darnit_baseline.threat_model.dependencies import parse_dependency_manifests
 from darnit_baseline.threat_model.discovery import (
+    _get_docstring_lines,
     _line_is_string_or_comment,
     _match_is_in_string_context,
     _python_imports,
     detect_frameworks,
     discover_data_stores,
     discover_injection_sinks,
+    discover_sensitive_data,
 )
 from darnit_baseline.threat_model.models import Confidence
+from darnit_baseline.threat_model.stride import analyze_stride_threats
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -286,6 +289,213 @@ class TestInjectionSinkFiltering:
         sinks = discover_injection_sinks(str(tmp_repo))
         assert len(sinks) > 0
 
+    def test_urlopen_hardcoded_url_not_flagged_as_ssrf(self, tmp_repo):
+        """urlopen() with a hardcoded/internal URL is NOT SSRF."""
+        _write(tmp_repo, "client.py", """\
+            import urllib.request
+            PYPI_URL = "https://pypi.org/pypi/{}/json"
+            def fetch_package(name):
+                url = PYPI_URL.format(name)
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    return resp.read()
+        """)
+        sinks = discover_injection_sinks(str(tmp_repo))
+        ssrf = [s for s in sinks if s["type"] == "ssrf"]
+        assert len(ssrf) == 0
+
+    def test_urlopen_with_user_input_flagged_as_ssrf(self, tmp_repo):
+        """urlopen() with user-controlled URL IS SSRF."""
+        _write(tmp_repo, "proxy.py", """\
+            import urllib.request
+            def fetch_url(request):
+                url = request.args.get("url")
+                with urllib.request.urlopen(url + request.path, timeout=10) as resp:
+                    return resp.read()
+        """)
+        sinks = discover_injection_sinks(str(tmp_repo))
+        ssrf = [s for s in sinks if s["type"] == "ssrf"]
+        assert len(ssrf) > 0
+
+    def test_injection_sink_has_user_input_flag(self, tmp_repo):
+        """Injection sinks carry has_user_input taint signal."""
+        _write(tmp_repo, "app.py", """\
+            import sqlite3
+            def get_user(request):
+                user_id = request.args["id"]
+                conn = sqlite3.connect("app.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users WHERE id=" + user_id)
+        """)
+        sinks = discover_injection_sinks(str(tmp_repo))
+        assert len(sinks) > 0
+        assert sinks[0]["has_user_input"] is True
+
+    def test_injection_sink_no_user_input_flag(self, tmp_repo):
+        """Injection sink without request context has has_user_input=False."""
+        _write(tmp_repo, "setup.py", """\
+            import sqlite3
+            def init_db():
+                conn = sqlite3.connect("app.db")
+                cursor = conn.cursor()
+                cursor.execute("CREATE TABLE users" + "(id INTEGER)")
+        """)
+        sinks = discover_injection_sinks(str(tmp_repo))
+        assert len(sinks) > 0
+        assert sinks[0]["has_user_input"] is False
+
+
+# ---------------------------------------------------------------------------
+# STRIDE threat filtering (taint-aware)
+# ---------------------------------------------------------------------------
+
+class TestStrideTaintFiltering:
+    def test_no_threats_for_untainted_sinks(self):
+        """Injection sinks without user-input taint should NOT generate threats."""
+        from darnit_baseline.threat_model.models import AssetInventory
+
+        assets = AssetInventory(
+            entry_points=[], data_stores=[], sensitive_data=[],
+            secrets=[], authentication=[], frameworks_detected=[],
+        )
+        sinks = [{
+            "type": "ssrf",
+            "file": "client.py",
+            "line": 10,
+            "snippet": "urllib.request.urlopen(api_url)",
+            "severity": "high",
+            "cwe": "CWE-918",
+            "recommendation": "Validate URLs",
+            "has_user_input": False,
+        }]
+        threats = analyze_stride_threats(assets, sinks)
+        tampering = [t for t in threats if t.category.value == "tampering"]
+        assert len(tampering) == 0
+
+    def test_threats_for_tainted_sinks(self):
+        """Injection sinks WITH user-input taint should generate threats."""
+        from darnit_baseline.threat_model.models import AssetInventory
+
+        assets = AssetInventory(
+            entry_points=[], data_stores=[], sensitive_data=[],
+            secrets=[], authentication=[], frameworks_detected=[],
+        )
+        sinks = [{
+            "type": "sql_injection",
+            "file": "app.py",
+            "line": 5,
+            "snippet": 'cursor.execute("SELECT * FROM users WHERE id=" + request.args["id"])',
+            "severity": "critical",
+            "cwe": "CWE-89",
+            "recommendation": "Use parameterized queries",
+            "has_user_input": True,
+        }]
+        threats = analyze_stride_threats(assets, sinks)
+        injection_threats = [
+            t for t in threats
+            if "injection" in t.title.lower() or "sql" in t.title.lower()
+        ]
+        assert len(injection_threats) == 1
+
+
+# ---------------------------------------------------------------------------
+# Docstring filtering
+# ---------------------------------------------------------------------------
+
+class TestDocstringFiltering:
+    def test_identifies_module_docstring(self):
+        code = textwrap.dedent('''\
+            """Module docstring with email and address."""
+            x = 1
+        ''')
+        lines = _get_docstring_lines(code)
+        assert 1 in lines
+
+    def test_identifies_function_docstring(self):
+        code = textwrap.dedent('''\
+            def foo():
+                """Function doc with email param."""
+                pass
+        ''')
+        lines = _get_docstring_lines(code)
+        assert 2 in lines
+
+    def test_identifies_multiline_docstring(self):
+        code = textwrap.dedent('''\
+            def foo():
+                """First line.
+
+                Args:
+                    email: The user email address.
+                """
+                pass
+        ''')
+        lines = _get_docstring_lines(code)
+        assert 5 in lines  # the "email:" line
+
+    def test_does_not_flag_code_lines(self):
+        code = textwrap.dedent('''\
+            def foo():
+                """Docstring."""
+                email = get_email()
+        ''')
+        lines = _get_docstring_lines(code)
+        assert 3 not in lines  # the assignment line
+
+
+# ---------------------------------------------------------------------------
+# Sensitive data false positive filtering
+# ---------------------------------------------------------------------------
+
+class TestSensitiveDataFiltering:
+    def test_docstring_email_not_flagged(self, tmp_repo):
+        """The word 'email' in a docstring should NOT be flagged as PII."""
+        _write(tmp_repo, "tools.py", '''\
+            def confirm_context(maintainers=None, security_contact=None):
+                """Record user-confirmed project context.
+
+                Parameters:
+                    security_contact: Security contact email or file reference
+                """
+                pass
+        ''')
+        data = discover_sensitive_data(str(tmp_repo))
+        pii = [d for d in data if d.data_type == "pii"]
+        assert len(pii) == 0
+
+    def test_comment_email_not_flagged(self, tmp_repo):
+        """The word 'email' in a comment should NOT be flagged as PII."""
+        _write(tmp_repo, "handler.py", """\
+            # Parse email addresses from maintainers file
+            def parse_maintainers(content):
+                return content.split()
+        """)
+        data = discover_sensitive_data(str(tmp_repo))
+        pii = [d for d in data if d.data_type == "pii"]
+        assert len(pii) == 0
+
+    def test_real_pii_field_still_flagged(self, tmp_repo):
+        """Actual PII field assignments should still be detected."""
+        _write(tmp_repo, "models.py", """\
+            class User:
+                email = Column(String)
+                phone_number = Column(String)
+        """)
+        data = discover_sensitive_data(str(tmp_repo))
+        pii = [d for d in data if d.data_type == "pii"]
+        assert len(pii) >= 2
+
+    def test_dict_key_pii_still_flagged(self, tmp_repo):
+        """PII in dict key assignments should still be detected."""
+        _write(tmp_repo, "handler.py", """\
+            user_data = {
+                "email": request.form["email"],
+                "phone": request.form["phone"],
+            }
+        """)
+        data = discover_sensitive_data(str(tmp_repo))
+        pii = [d for d in data if d.data_type == "pii"]
+        assert len(pii) >= 1
+
 
 # ---------------------------------------------------------------------------
 # Self-scan: run against the darnit repo itself
@@ -329,4 +539,29 @@ class TestSelfScan:
         false_positives = set(frameworks) & web_frameworks
         assert false_positives == set(), (
             f"False positive frameworks detected: {false_positives}"
+        )
+
+    def test_no_ssrf_false_positives(self, repo_root):
+        """Darnit's own urlopen() calls should not be flagged as SSRF."""
+        sinks = discover_injection_sinks(repo_root)
+        ssrf = [s for s in sinks if s["type"] == "ssrf"]
+        assert len(ssrf) == 0, (
+            f"SSRF false positives: {[(s['file'], s['line']) for s in ssrf]}"
+        )
+
+    def test_no_injection_threats_from_self_scan(self, repo_root):
+        """Self-scan should produce zero injection threats (no user-facing endpoints)."""
+        from darnit_baseline.threat_model.discovery import discover_all_assets
+        assets = discover_all_assets(repo_root)
+        sinks = discover_injection_sinks(repo_root)
+        threats = analyze_stride_threats(assets, sinks)
+        injection_threats = [
+            t for t in threats
+            if "injection" in t.title.lower()
+            or "ssrf" in t.title.lower()
+            or "xss" in t.title.lower()
+        ]
+        assert len(injection_threats) == 0, (
+            f"False positive injection threats from self-scan: "
+            f"{[(t.title, t.code_locations[0].file if t.code_locations else '?') for t in injection_threats]}"
         )
