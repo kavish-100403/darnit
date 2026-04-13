@@ -186,6 +186,113 @@ def _strip_quotes(text: str) -> str:
     return text
 
 
+def _extract_kwarg(call_node: Any, kwarg_name: str, source: bytes) -> str | None:
+    """Extract the string value of a keyword argument from a call node.
+
+    Given ``f(a, name="foo")``, ``_extract_kwarg(node, "name", src)``
+    returns ``"foo"``. Returns ``None`` if the keyword is absent or its
+    value is not a string literal.
+    """
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type == "keyword_argument":
+                    key_node = arg.child_by_field_name("name")
+                    val_node = arg.child_by_field_name("value")
+                    if key_node and val_node and _text(key_node, source) == kwarg_name:
+                        val_text = _text(val_node, source)
+                        stripped = _strip_quotes(val_text)
+                        if stripped != val_text:
+                            return stripped
+                        # Value is an identifier (variable reference) — return it
+                        if val_node.type == "identifier":
+                            return val_text
+    return None
+
+
+def _is_kwarg_string_literal(call_node: Any, kwarg_name: str, source: bytes) -> bool:
+    """Return True if the named kwarg exists and its value is a string literal."""
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type == "keyword_argument":
+                    key_node = arg.child_by_field_name("name")
+                    val_node = arg.child_by_field_name("value")
+                    if key_node and val_node and _text(key_node, source) == kwarg_name:
+                        val_text = _text(val_node, source)
+                        return _strip_quotes(val_text) != val_text
+    return False
+
+
+def _find_enclosing_for_loop(node: Any) -> Any | None:
+    """Walk parent chain to find an enclosing ``for_statement``, if any."""
+    cursor = node.parent
+    while cursor is not None:
+        if cursor.type == "for_statement":
+            return cursor
+        cursor = cursor.parent
+    return None
+
+
+def _describe_for_loop_iterable(for_node: Any, source: bytes) -> str | None:
+    """Extract a human-readable label from a for-loop's iterable.
+
+    For ``for name, spec in registry.tools.items():``, returns
+    ``"registry.tools"``.  Returns ``None`` on unrecognised shapes.
+    """
+    # The iterable is the right-hand side of ``in``
+    # In tree-sitter python grammar: for_statement has fields "left" and "right"
+    right = for_node.child_by_field_name("right")
+    if right is None:
+        return None
+    text = _text(right, source)
+    # Strip common iterator suffixes
+    for suffix in (".items()", ".keys()", ".values()", ".entries()"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _extract_first_positional_arg(call_node: Any, source: bytes) -> str | None:
+    """Return the text of the first positional (non-keyword) argument.
+
+    For ``f(handler, name="x")``, returns ``"handler"``.
+    """
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type not in ("keyword_argument", ",", "(", ")"):
+                    return _text(arg, source)
+    return None
+
+
+def _extract_nth_positional_arg(
+    call_node: Any, n: int, source: bytes
+) -> str | None:
+    """Return the text of the *n*-th positional (non-keyword) argument (0-indexed)."""
+    idx = 0
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type not in ("keyword_argument", ",", "(", ")"):
+                    if idx == n:
+                        return _text(arg, source)
+                    idx += 1
+    return None
+
+
+def _extract_first_positional_string(
+    call_node: Any, source: bytes
+) -> str | None:
+    """Return the unquoted value of the first positional string literal argument."""
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type == "string":
+                    return _strip_quotes(_text(arg, source))
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Python extractors
 # ---------------------------------------------------------------------------
@@ -315,6 +422,108 @@ def _extract_python_entry_points(
             )
         )
 
+    # Imperative MCP tool registration: server.add_tool(handler, name=...)
+    query = py_queries.QUERY_REGISTRY["python.entry.mcp_tool_imperative"].query
+    # Track for-loop–based registrations to emit one entry per loop, not per
+    # match (the loop body matches N times but represents one registration site
+    # that produces M tools at runtime).
+    _seen_loop_sites: set[int] = set()
+    for caps in run_query(query, tree.root_node):
+        method = _text(caps["method"][0], source)
+        if method != "add_tool":
+            continue
+        call_node = caps["call"][0]
+
+        # Check whether the name kwarg is a string literal vs. a variable.
+        is_literal = _is_kwarg_string_literal(call_node, "name", source)
+        tool_name = _extract_kwarg(call_node, "name", source)
+        if tool_name is None:
+            tool_name = _extract_first_positional_arg(call_node, source)
+        if tool_name is None:
+            continue
+
+        if is_literal:
+            # Static name — one entry point per call site.
+            entries.append(
+                DiscoveredEntryPoint(
+                    kind=EntryPointKind.MCP_TOOL,
+                    name=tool_name,
+                    location=_build_location(call_node, file.relpath),
+                    language="python",
+                    framework="mcp",
+                    route_path=None,
+                    http_method=None,
+                    has_auth_decorator=False,
+                    source_query="python.entry.mcp_tool_imperative",
+                )
+            )
+        else:
+            # Dynamic name (variable) — likely inside a for-loop registering
+            # multiple tools from a registry/dict.  Emit one entry per loop
+            # site rather than duplicating for each tree-sitter match.
+            for_loop = _find_enclosing_for_loop(call_node)
+            if for_loop is not None:
+                loop_id = for_loop.start_point[0]  # line number
+                if loop_id in _seen_loop_sites:
+                    continue  # already emitted for this loop
+                _seen_loop_sites.add(loop_id)
+                iterable = _describe_for_loop_iterable(for_loop, source)
+                label = (
+                    f"(dynamic — registered from {iterable})"
+                    if iterable
+                    else "(dynamic — loop registration)"
+                )
+            else:
+                label = f"(dynamic: {tool_name})"
+
+            entries.append(
+                DiscoveredEntryPoint(
+                    kind=EntryPointKind.MCP_TOOL,
+                    name=label,
+                    location=_build_location(call_node, file.relpath),
+                    language="python",
+                    framework="mcp",
+                    route_path=None,
+                    http_method=None,
+                    has_auth_decorator=False,
+                    source_query="python.entry.mcp_tool_imperative",
+                )
+            )
+
+    # Imperative HTTP route registration: app.add_url_rule / app.add_route
+    query = py_queries.QUERY_REGISTRY["python.entry.http_route_imperative"].query
+    for caps in run_query(query, tree.root_node):
+        method = _text(caps["method"][0], source)
+        if method not in ("add_url_rule", "add_route"):
+            continue
+        call_node = caps["call"][0]
+        route_path = _extract_first_positional_string(call_node, source)
+        if route_path is None:
+            continue
+        framework = _infer_python_http_framework(imports)
+        # Try to extract the endpoint name from kwargs or positional args
+        endpoint_name = _extract_kwarg(call_node, "endpoint", source)
+        if endpoint_name is None:
+            endpoint_name = _extract_kwarg(call_node, "view_func", source)
+        if endpoint_name is None:
+            # Second positional arg is often the endpoint name
+            endpoint_name = _extract_nth_positional_arg(call_node, 1, source)
+        if endpoint_name is None:
+            endpoint_name = route_path
+        entries.append(
+            DiscoveredEntryPoint(
+                kind=EntryPointKind.HTTP_ROUTE,
+                name=endpoint_name,
+                location=_build_location(call_node, file.relpath),
+                language="python",
+                framework=framework,
+                route_path=route_path,
+                http_method=None,
+                has_auth_decorator=False,
+                source_query="python.entry.http_route_imperative",
+            )
+        )
+
     return entries
 
 
@@ -414,28 +623,28 @@ def _extract_python_data_stores(
     return stores
 
 
-def _subprocess_call_is_clearly_safe(call_node: Any, source: bytes) -> bool:
-    """Return True when a subprocess call is a clear false positive.
+def _classify_subprocess_arg_shape(call_node: Any, source: bytes) -> str:
+    """Classify a subprocess call into a risk tier based on argument shape.
 
-    "Clearly safe" means both:
-    1. The first positional argument is a **list literal** whose elements
-       are all string literals — no variables, no concatenation, no f-strings.
-    2. The call does NOT pass ``shell=True``.
-
-    This filters out the common ``subprocess.run(["cmd", "arg1", "arg2"])``
-    idiom used throughout darnit's own test suite. A call with a variable
-    argument stays as a finding (we can't rule it out without taint),
-    and a ``shell=True`` call stays as a finding regardless (shell=True is
-    dangerous even with a literal string).
+    Returns one of:
+    - ``"shell"``  — ``shell=True`` is present (always highest risk)
+    - ``"dynamic"`` — first arg is a bare variable, function call, or any
+      non-list expression
+    - ``"parameterized"`` — first arg is a list literal containing at least
+      one non-literal element (variable, f-string, call expression)
+    - ``"static"`` — first arg is a list literal with ALL string literal
+      elements (no variables, no f-strings)
     """
     args = call_node.child_by_field_name("arguments")
     if args is None:
-        return False
+        return "dynamic"
 
     first_positional: Any | None = None
     has_shell_true = False
 
     for child in args.named_children:
+        if child.type == "comment":
+            continue  # skip inline noqa / type: ignore comments
         if child.type == "keyword_argument":
             key_node = child.child_by_field_name("name")
             value_node = child.child_by_field_name("value")
@@ -450,16 +659,191 @@ def _subprocess_call_is_clearly_safe(call_node: Any, source: bytes) -> bool:
             first_positional = child
 
     if has_shell_true:
-        return False
+        return "shell"
     if first_positional is None:
-        return False
+        return "dynamic"
     if first_positional.type != "list":
-        return False
-    # All list elements must be string literals.
+        return "dynamic"
+    # List literal — check whether all elements are string literals.
     for item in first_positional.named_children:
         if item.type != "string":
-            return False
-    return True
+            return "parameterized"
+    return "static"
+
+
+def _is_config_driven_subprocess(
+    call_node: Any, source: bytes, tree: Any
+) -> bool:
+    """Check if a subprocess call's command argument was populated from config/dict.
+
+    Heuristic: the first argument to the subprocess call is a variable, and
+    within the same function scope, that variable is assigned from:
+    - A dict subscript: ``config["key"]`` or ``config.get("key")``
+    - A loop over a dict: ``for x in config.items()``
+    - An extend/append from config values
+
+    This catches patterns like::
+
+        cmd = config["command"]
+        subprocess.run(cmd, ...)
+
+    and::
+
+        for arg in command:
+            resolved_cmd.append(arg.replace(var, val))
+        subprocess.run(resolved_cmd, ...)
+    """
+    # 1. Get first positional argument of the subprocess call.
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return False
+
+    first_positional: Any | None = None
+    for child in args.named_children:
+        if child.type == "keyword_argument":
+            continue
+        first_positional = child
+        break
+
+    if first_positional is None or first_positional.type != "identifier":
+        return False
+
+    var_name = _text(first_positional, source)
+
+    # 2. Find the enclosing function_definition node.
+    enclosing_func: Any | None = call_node.parent
+    while enclosing_func is not None and enclosing_func.type != "function_definition":
+        enclosing_func = enclosing_func.parent
+    if enclosing_func is None:
+        return False
+
+    body = enclosing_func.child_by_field_name("body")
+    if body is None:
+        return False
+
+    # 3. Walk the function body looking for dict-related assignments to var_name.
+    return _body_has_config_assignment(body, var_name, source)
+
+
+def _body_has_config_assignment(body: Any, var_name: str, source: bytes) -> bool:
+    """Walk *body* for assignments to *var_name* that originate from a dict.
+
+    Also handles one level of transitivity: if ``full_cmd = [cmd] + args``
+    and ``cmd = config["command"]``, the function recognises that
+    ``full_cmd`` is indirectly config-derived.
+    """
+    _DICT_METHODS = frozenset({"get", "items", "values", "keys", "pop"})
+    _LIST_MUTATORS = frozenset({"extend", "append"})
+
+    # Pass 1: collect all local variable names that are directly assigned
+    # from a dict access expression (e.g. ``cmd = config["command"]``).
+    config_vars: set[str] = set()
+    for node in _walk_descendants(body):
+        if node.type in ("assignment", "augmented_assignment"):
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if lhs is None or rhs is None:
+                continue
+            if lhs.type != "identifier":
+                continue
+            if _is_dict_access_expr(rhs, source, _DICT_METHODS):
+                config_vars.add(_text(lhs, source))
+
+    # Direct match: the subprocess argument variable itself is config-derived.
+    if var_name in config_vars:
+        return True
+
+    # Pass 2: walk the body again looking for patterns that link var_name
+    # to config_vars (transitive) or to dict-like iteration/mutation.
+    for node in _walk_descendants(body):
+        # --- assignment: var_name = <rhs> ---
+        if node.type in ("assignment", "augmented_assignment"):
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if lhs is None or rhs is None:
+                continue
+            if _text(lhs, source) != var_name:
+                continue
+            # Direct dict access on RHS.
+            if _is_dict_access_expr(rhs, source, _DICT_METHODS):
+                return True
+            # Transitive: RHS references a variable known to be config-derived.
+            if config_vars and _rhs_references_config_vars(
+                rhs, source, config_vars
+            ):
+                return True
+
+        # --- for ... in <expr>.items() / for ... in config ---
+        if node.type == "for_statement":
+            right = node.child_by_field_name("right")
+            if right is not None and _is_dict_access_expr(
+                right, source, _DICT_METHODS
+            ):
+                return True
+
+        # --- var.append(config[...]) / var.extend(config.values()) ---
+        if node.type == "expression_statement":
+            expr = node.named_children[0] if node.named_children else None
+            if expr is not None and expr.type == "call":
+                func_node = expr.child_by_field_name("function")
+                if func_node is not None and func_node.type == "attribute":
+                    obj_node = func_node.child_by_field_name("object")
+                    attr_node = func_node.child_by_field_name("attribute")
+                    if (
+                        obj_node is not None
+                        and attr_node is not None
+                        and _text(obj_node, source) == var_name
+                        and _text(attr_node, source) in _LIST_MUTATORS
+                    ):
+                        call_args = expr.child_by_field_name("arguments")
+                        if call_args is not None:
+                            for arg in call_args.named_children:
+                                if _is_dict_access_expr(
+                                    arg, source, _DICT_METHODS
+                                ):
+                                    return True
+
+    return False
+
+
+def _rhs_references_config_vars(
+    node: Any, source: bytes, config_vars: set[str]
+) -> bool:
+    """Return True if *node* (an RHS expression) contains any identifier
+    that appears in *config_vars*."""
+    if node.type == "identifier" and _text(node, source) in config_vars:
+        return True
+    for child in node.children:
+        if _rhs_references_config_vars(child, source, config_vars):
+            return True
+    return False
+
+
+def _is_dict_access_expr(
+    node: Any, source: bytes, dict_methods: frozenset[str]
+) -> bool:
+    """Return True if *node* looks like a dict access expression.
+
+    Matches:
+    - subscript: ``config["key"]``
+    - attribute call: ``config.get("key")`` / ``.items()`` / ``.values()``
+    """
+    if node.type == "subscript":
+        return True
+    if node.type == "call":
+        func = node.child_by_field_name("function")
+        if func is not None and func.type == "attribute":
+            attr = func.child_by_field_name("attribute")
+            if attr is not None and _text(attr, source) in dict_methods:
+                return True
+    return False
+
+
+def _walk_descendants(node: Any):
+    """Yield all descendant nodes of *node* in pre-order."""
+    for child in node.children:
+        yield child
+        yield from _walk_descendants(child)
 
 
 def _extract_python_subprocess_findings(
@@ -475,15 +859,24 @@ def _extract_python_subprocess_findings(
         if (obj, method) not in _PY_DANGEROUS_PAIRS:
             continue
         call_node = caps["call"][0]
-        if _subprocess_call_is_clearly_safe(call_node, source):
-            continue
+        tier = _classify_subprocess_arg_shape(call_node, source)
         location = _build_location(call_node, file.relpath)
+
+        # Elevate confidence when the command argument originates from a
+        # config/dict lookup — this is a well-known attack surface for
+        # TOML-driven command construction.
+        config_driven = tier == "dynamic" and _is_config_driven_subprocess(
+            call_node, source, tree
+        )
+
         findings.append(
             _build_subprocess_finding(
                 source,
                 location,
                 title=f"Potential command injection via {obj}.{method}",
                 query_id="python.sink.dangerous_attr",
+                tier=tier,
+                config_driven=config_driven,
             )
         )
 
@@ -525,21 +918,319 @@ def _extract_python_subprocess_findings(
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Additional STRIDE category extractors
+# ---------------------------------------------------------------------------
+
+#: Broad exception handler types that may leak sensitive state.
+_BROAD_EXCEPT_TYPES = frozenset({"Exception", "BaseException"})
+
+#: Known subprocess/network calls that should have timeouts.
+_TIMEOUT_EXPECTED_CALLS = frozenset({
+    ("subprocess", "run"),
+    ("subprocess", "call"),
+    ("subprocess", "check_call"),
+    ("subprocess", "check_output"),
+    ("subprocess", "Popen"),
+    ("requests", "get"),
+    ("requests", "post"),
+    ("requests", "put"),
+    ("requests", "delete"),
+    ("requests", "patch"),
+    ("requests", "request"),
+    ("urllib", "urlopen"),
+    ("httpx", "get"),
+    ("httpx", "post"),
+})
+
+
+def _has_timeout_kwarg(call_node: Any, source: bytes) -> bool:
+    """Check if a call node has a ``timeout=`` keyword argument."""
+    for child in call_node.children:
+        if child.type == "argument_list":
+            for arg in child.children:
+                if arg.type == "keyword_argument":
+                    key_node = arg.child_by_field_name("name")
+                    if key_node and _text(key_node, source) == "timeout":
+                        return True
+    return False
+
+
+def _extract_python_info_disclosure_findings(
+    file: ScannedFile, source: bytes, tree: Any
+) -> list[CandidateFinding]:
+    """Detect patterns that may leak sensitive information."""
+    findings: list[CandidateFinding] = []
+
+    # Broad exception handlers (except Exception / bare except)
+    query = py_queries.QUERY_REGISTRY["python.info_disc.broad_except"].query
+    for caps in run_query(query, tree.root_node):
+        handler_type = _text(caps["handler"][0], source)
+        if handler_type not in _BROAD_EXCEPT_TYPES:
+            continue
+        body_node = caps["body"][0]
+        body_text = _text(body_node, source)
+        # Only flag if the handler re-raises or returns the exception
+        # (potential traceback leak). Skip handlers that just log.
+        if "traceback" in body_text or "str(e)" in body_text or "repr(e)" in body_text:
+            location = _build_location(caps["handler"][0], file.relpath)
+            snippet = _build_snippet(source, location.line)
+            findings.append(
+                CandidateFinding(
+                    category=StrideCategory.INFORMATION_DISCLOSURE,
+                    title=f"Broad except {handler_type} may leak error details",
+                    source=FindingSource.TREE_SITTER_STRUCTURAL,
+                    primary_location=location,
+                    related_assets=(),
+                    code_snippet=snippet,
+                    severity=severity_for(
+                        StrideCategory.INFORMATION_DISCLOSURE,
+                        has_taint_trace=False,
+                    ),
+                    confidence=0.5,
+                    rationale=(
+                        f"A broad ``except {handler_type}`` handler exposes "
+                        "exception details (traceback, str(e), or repr(e)). "
+                        "In production, this may leak internal file paths, "
+                        "stack frames, or sensitive state to callers."
+                    ),
+                    query_id="python.info_disc.broad_except",
+                )
+            )
+
+    # open() with variable path — potential path traversal
+    query = py_queries.QUERY_REGISTRY["python.info_disc.open_call"].query
+    for caps in run_query(query, tree.root_node):
+        call_node = caps["call"][0]
+        first_arg = _extract_first_positional_arg(call_node, source)
+        if first_arg is None:
+            continue
+        # Only flag when the argument is a variable (not a string literal)
+        stripped = _strip_quotes(first_arg)
+        if stripped != first_arg:
+            continue  # string literal — not interesting
+        location = _build_location(call_node, file.relpath)
+        snippet = _build_snippet(source, location.line)
+        findings.append(
+            CandidateFinding(
+                category=StrideCategory.INFORMATION_DISCLOSURE,
+                title=f"File open with variable path: {first_arg}",
+                source=FindingSource.TREE_SITTER_STRUCTURAL,
+                primary_location=location,
+                related_assets=(),
+                code_snippet=snippet,
+                severity=severity_for(
+                    StrideCategory.INFORMATION_DISCLOSURE,
+                    has_taint_trace=False,
+                ),
+                confidence=0.4,
+                rationale=(
+                    f"``open({first_arg})`` uses a variable path. If the path "
+                    "originates from user input without validation, this "
+                    "enables path traversal attacks (reading arbitrary files)."
+                ),
+                query_id="python.info_disc.open_call",
+            )
+        )
+
+    return findings
+
+
+def _extract_python_dos_findings(
+    file: ScannedFile, source: bytes, tree: Any
+) -> list[CandidateFinding]:
+    """Detect patterns that may cause denial of service."""
+    findings: list[CandidateFinding] = []
+
+    # subprocess / network calls without timeout
+    attr_query = py_queries.QUERY_REGISTRY["python.sink.dangerous_attr"].query
+    for caps in run_query(attr_query, tree.root_node):
+        obj = _text(caps["obj"][0], source)
+        method = _text(caps["method"][0], source)
+        if (obj, method) not in _TIMEOUT_EXPECTED_CALLS:
+            continue
+        call_node = caps["call"][0]
+        if _has_timeout_kwarg(call_node, source):
+            continue  # timeout present — not a DoS concern
+        location = _build_location(call_node, file.relpath)
+        snippet = _build_snippet(source, location.line)
+        findings.append(
+            CandidateFinding(
+                category=StrideCategory.DENIAL_OF_SERVICE,
+                title=f"No timeout on {obj}.{method}()",
+                source=FindingSource.TREE_SITTER_STRUCTURAL,
+                primary_location=location,
+                related_assets=(),
+                code_snippet=snippet,
+                severity=severity_for(
+                    StrideCategory.DENIAL_OF_SERVICE, has_taint_trace=False
+                ),
+                confidence=0.6,
+                rationale=(
+                    f"``{obj}.{method}()`` is called without a ``timeout`` "
+                    "parameter. A hung subprocess or unresponsive network "
+                    "endpoint will block the caller indefinitely, which can "
+                    "be exploited for denial of service."
+                ),
+                query_id="python.sink.dangerous_attr",
+            )
+        )
+
+    return findings
+
+
+def _extract_python_eop_findings(
+    file: ScannedFile, source: bytes, tree: Any
+) -> list[CandidateFinding]:
+    """Detect elevation of privilege patterns beyond eval/exec."""
+    findings: list[CandidateFinding] = []
+
+    # Dynamic import: importlib.import_module(...)
+    query = py_queries.QUERY_REGISTRY["python.eop.dynamic_import_attr"].query
+    for caps in run_query(query, tree.root_node):
+        call_node = caps["call"][0]
+        first_arg = _extract_first_positional_arg(call_node, source)
+        arg_label = first_arg or "..."
+        # Only interesting if argument is a variable, not a literal
+        if first_arg and _strip_quotes(first_arg) != first_arg:
+            continue
+        location = _build_location(call_node, file.relpath)
+        snippet = _build_snippet(source, location.line)
+        findings.append(
+            CandidateFinding(
+                category=StrideCategory.ELEVATION_OF_PRIVILEGE,
+                title=f"Dynamic import via importlib.import_module({arg_label})",
+                source=FindingSource.TREE_SITTER_STRUCTURAL,
+                primary_location=location,
+                related_assets=(),
+                code_snippet=snippet,
+                severity=severity_for(
+                    StrideCategory.ELEVATION_OF_PRIVILEGE,
+                    has_taint_trace=False,
+                ),
+                confidence=0.5,
+                rationale=(
+                    "Dynamic imports allow loading arbitrary modules at "
+                    "runtime. If the module name originates from untrusted "
+                    "input, an attacker can achieve arbitrary code execution."
+                ),
+                query_id="python.eop.dynamic_import_attr",
+            )
+        )
+
+    # __import__(...)
+    query = py_queries.QUERY_REGISTRY["python.eop.dynamic_import_bare"].query
+    for caps in run_query(query, tree.root_node):
+        call_node = caps["call"][0]
+        location = _build_location(call_node, file.relpath)
+        snippet = _build_snippet(source, location.line)
+        findings.append(
+            CandidateFinding(
+                category=StrideCategory.ELEVATION_OF_PRIVILEGE,
+                title="Dynamic import via __import__()",
+                source=FindingSource.TREE_SITTER_STRUCTURAL,
+                primary_location=location,
+                related_assets=(),
+                code_snippet=snippet,
+                severity=severity_for(
+                    StrideCategory.ELEVATION_OF_PRIVILEGE,
+                    has_taint_trace=False,
+                ),
+                confidence=0.4,
+                rationale=(
+                    "__import__() enables dynamic module loading. If the "
+                    "argument is derived from user input, this is an "
+                    "arbitrary code execution vector."
+                ),
+                query_id="python.eop.dynamic_import_bare",
+            )
+        )
+
+    # os.chmod / os.chown / os.setuid
+    query = py_queries.QUERY_REGISTRY["python.eop.permission_change"].query
+    for caps in run_query(query, tree.root_node):
+        method = _text(caps["method"][0], source)
+        call_node = caps["call"][0]
+        location = _build_location(call_node, file.relpath)
+        snippet = _build_snippet(source, location.line)
+        findings.append(
+            CandidateFinding(
+                category=StrideCategory.ELEVATION_OF_PRIVILEGE,
+                title=f"Permission modification via os.{method}()",
+                source=FindingSource.TREE_SITTER_STRUCTURAL,
+                primary_location=location,
+                related_assets=(),
+                code_snippet=snippet,
+                severity=severity_for(
+                    StrideCategory.ELEVATION_OF_PRIVILEGE,
+                    has_taint_trace=False,
+                ),
+                confidence=0.6,
+                rationale=(
+                    f"``os.{method}()`` modifies filesystem permissions or "
+                    "process identity. If arguments are influenced by "
+                    "untrusted input, this can be used for privilege "
+                    "escalation."
+                ),
+                query_id="python.eop.permission_change",
+            )
+        )
+
+    return findings
+
+
 def _build_subprocess_finding(
     source: bytes,
     location: Location,
     title: str,
     query_id: str,
+    tier: str = "dynamic",
+    config_driven: bool = False,
 ) -> CandidateFinding:
     snippet = _build_snippet(source, location.line)
-    severity = severity_for(StrideCategory.TAMPERING, has_taint_trace=False)
-    # Deliberately low confidence: without Opengrep taint analysis, we
-    # cannot confirm external input reaches this sink. Opengrep taint will lift
-    # matching findings to OPENGREP_TAINT with confidence 1.0.
-    confidence = confidence_for(
-        FindingSource.TREE_SITTER_STRUCTURAL,
-        query_intent="dangerous_sink_no_taint",
-    )
+
+    # Tier-specific severity and confidence overrides.
+    # These bypass ranking.py's severity_for/confidence_for because the
+    # four subprocess tiers require finer-grained differentiation than the
+    # generic (STRIDE-category, taint-boolean) matrix provides.
+    _TIER_SCORES: dict[str, tuple[int, float, str]] = {
+        "static": (
+            1,
+            0.2,
+            "Static literal command — no injection risk without shell=True.",
+        ),
+        "parameterized": (
+            4,
+            0.6,
+            "Command list contains variable arguments that may originate "
+            "from external input.",
+        ),
+        "dynamic": (
+            6,
+            0.8,
+            "Entire command built dynamically — highest injection risk "
+            "without taint confirmation.",
+        ),
+        "shell": (
+            8,
+            0.9,
+            "shell=True enables shell interpretation of the command string, "
+            "greatly increasing injection risk.",
+        ),
+    }
+
+    severity, confidence, tier_rationale = _TIER_SCORES[tier]
+
+    # Config-driven subprocess calls get elevated confidence because the
+    # command argument originates from a configuration/dict lookup, which
+    # is a well-known attack surface (e.g. TOML-driven command templates).
+    if config_driven:
+        confidence = 0.9
+        tier_rationale = (
+            f"{tier_rationale} Command argument is populated from "
+            "configuration/dict lookup within the same function scope."
+        )
+
     return CandidateFinding(
         category=StrideCategory.TAMPERING,
         title=title,
@@ -550,11 +1241,9 @@ def _build_subprocess_finding(
         severity=severity,
         confidence=confidence,
         rationale=(
-            "Dynamic execution sink detected by tree-sitter structural query. "
-            "The argument was not confirmed as external input (no taint "
-            "analysis). Opengrep taint analysis will lift confirmed cases "
-            "to high confidence; until then this finding is low-confidence "
-            "and may be filtered by the draft's top-N cap."
+            f"[subprocess/{tier}] {tier_rationale} "
+            "Opengrep taint analysis will lift confirmed cases "
+            "to high confidence."
         ),
         query_id=query_id,
     )
@@ -930,31 +1619,41 @@ def _merge_opengrep_into_findings(
 
     Dedup strategy: if an Opengrep finding lands on the same (file, line)
     as an existing tree-sitter finding, the Opengrep finding wins (it has
-    higher confidence and may include a taint trace). Tree-sitter findings
-    at unique locations are kept. Opengrep findings at unique locations are
-    added.
+    higher confidence and may include a taint trace). ALL tree-sitter
+    findings at that location are replaced (the first is overwritten, the
+    rest are dropped). Tree-sitter findings at unique locations are kept.
+    Opengrep findings at unique locations are added.
     """
-    # Index tree-sitter findings by (file, line) for fast lookup
-    ts_index: dict[tuple[str, int], int] = {}
+    # Index ALL tree-sitter findings by (file, line) — there may be
+    # multiple findings at the same line (e.g. Tampering + DoS for a
+    # subprocess call).
+    ts_by_location: dict[tuple[str, int], list[int]] = {}
     for i, f in enumerate(ts_findings):
         key = (f.primary_location.file, f.primary_location.line)
-        ts_index[key] = i
+        ts_by_location.setdefault(key, []).append(i)
 
     merged = list(ts_findings)
-    replaced_indices: set[int] = set()
+    drop_indices: set[int] = set()
 
     for og in og_findings:
         key = (og.primary_location.file, og.primary_location.line)
-        if key in ts_index:
-            # Replace the tree-sitter finding with the richer Opengrep one
-            idx = ts_index[key]
-            if idx not in replaced_indices:
-                merged[idx] = og
-                replaced_indices.add(idx)
+        if key in ts_by_location:
+            indices = ts_by_location[key]
+            # Replace the first ts finding with the Opengrep one;
+            # drop all others at this location.
+            replaced_first = False
+            for idx in indices:
+                if not replaced_first:
+                    merged[idx] = og
+                    replaced_first = True
+                else:
+                    drop_indices.add(idx)
         else:
             # New location — add alongside tree-sitter findings
             merged.append(og)
 
+    if drop_indices:
+        merged = [f for i, f in enumerate(merged) if i not in drop_indices]
     return merged
 
 
@@ -1153,6 +1852,15 @@ def discover_all(
                 findings.extend(
                     _extract_python_subprocess_findings(file, source, tree)
                 )
+                findings.extend(
+                    _extract_python_info_disclosure_findings(file, source, tree)
+                )
+                findings.extend(
+                    _extract_python_dos_findings(file, source, tree)
+                )
+                findings.extend(
+                    _extract_python_eop_findings(file, source, tree)
+                )
                 call_graph.extend(_extract_python_call_graph(file, source, tree))
         elif lang == "go":
             entry_points.extend(_extract_go_entry_points(file, source, tree))
@@ -1186,6 +1894,14 @@ def discover_all(
             len(og_result.findings),
             len(og_findings),
             len(findings),
+        )
+
+    if not entry_points and scan_stats.in_scope_files > 50:
+        logger.warning(
+            "discover_all: zero entry points found in a repository with %d "
+            "in-scope files. This likely indicates missing query coverage for "
+            "the project's framework or registration pattern.",
+            scan_stats.in_scope_files,
         )
 
     logger.debug(
