@@ -292,11 +292,15 @@ allow_sieve_hints = true
 type = "string"
 prompt = "What is the security contact for vulnerability reports?"
 hint = "Email address, URL, or reference to SECURITY.md section"
-examples = ["security@example.com", "https://example.com/security", "See SECURITY.md"]
+examples = ["See SECURITY.md"]
 affects = ["OSPS-VM-01.01", "OSPS-VM-02.01", "OSPS-VM-03.01"]
 store_as = "security.contact"
-auto_detect = false
+auto_detect = true
 required = false
+hint_sources = ["SECURITY.md", ".github/SECURITY.md"]
+allow_sieve_hints = true
+# Filter: reject detected values containing "example.com" or "example.org"
+detect_filter = "!value.contains('example.com') && !value.contains('example.org')"
 
 [context.governance_model]
 type = "enum"
@@ -325,6 +329,7 @@ presentation_hint = "[y/N]"
 type = "boolean"
 prompt = "Does this project make official releases?"
 hint = "Set to true if you publish versioned releases"
+no_detect_hint = "No releases, version tags, or release workflows were found in the repository. Do you plan to publish versioned releases in the future? Release-related controls will be marked N/A if set to false."
 examples = ["true", "false"]
 affects = ["OSPS-BR-02.01", "OSPS-BR-03.01", "OSPS-BR-04.01"]
 store_as = "build.has_releases"
@@ -335,7 +340,7 @@ detect = [
     { handler = "file_exists", files = [".github/workflows/release*"], value_if_pass = true },
     { handler = "file_exists", files = ["CHANGELOG.md", "CHANGELOG", "CHANGES.md", "CHANGES"], value_if_pass = true },
     { handler = "exec", command = ["git", "tag", "--list", "v*"], pass_exit_codes = [0], expr = 'output.stdout != ""', value_if_pass = true },
-    { handler = "exec", command = ["gh", "release", "list", "--repo", "$OWNER/$REPO", "--limit", "1"], pass_exit_codes = [0], value_if_pass = true, value_if_fail = false },
+    { handler = "exec", command = ["gh", "release", "list", "--repo", "$OWNER/$REPO", "--limit", "1"], pass_exit_codes = [0], expr = 'output.stdout != ""', value_if_pass = true, value_if_fail = false },
 ]
 
 [context.is_library]
@@ -940,7 +945,7 @@ handler = "exec"
 command = ["gh", "release", "list", "--json", "tagName", "--limit", "10"]
 pass_exit_codes = [0]
 output_format = "json"
-expr = 'size(output.json) > 0'
+expr = 'size(output.json) > 0 && output.json[0].tagName.matches("^v?[0-9]")'
 timeout = 30
 
 [[controls."OSPS-BR-02.01".passes]]
@@ -1608,7 +1613,7 @@ handler = "exec"
 command = ["gh", "release", "view", "--json", "body,assets"]
 pass_exit_codes = [0]
 output_format = "json"
-expr = 'output.json.body != ""'
+expr = 'output.json.body.matches("(?i)(licen[cs]e|apache|mit\\s|bsd|gpl|mpl|isc|unlicense)") || output.json.assets.exists(a, a.name.matches("(?i)^(license|copying|notice)"))'
 timeout = 30
 
 [[controls."OSPS-LE-02.02".passes]]
@@ -1975,13 +1980,13 @@ help_md = """Remove unreviewable binary files from repository.
 
 [[controls."OSPS-QA-05.02".passes]]
 handler = "pattern"
-exclude_files = ["**/*.jar", "**/*.war", "**/*.pyc", "**/*.class", "**/*.o"]
+exclude_files = ["**/*.jar", "**/*.war", "**/*.pyc", "**/*.class", "**/*.o", "**/*.exe", "**/*.dll", "**/*.so", "**/*.dylib", "**/*.whl", "**/*.egg", "**/*.bin", "**/*.db", "**/*.sqlite"]
 expr = 'output.files_found == 0'
 
 [[controls."OSPS-QA-05.02".passes]]
 handler = "manual"
 steps = [
-    "Search repository for binary artifacts (.jar, .war, .pyc, .class)",
+    "Search repository for binary artifacts (.jar, .war, .pyc, .class, .exe, .dll, .so, .whl)",
     "Verify no unreviewable binaries are committed",
     "Check that build artifacts are in .gitignore",
 ]
@@ -2124,18 +2129,22 @@ steps = [
 ]
 
 [controls."OSPS-AC-04.01".remediation]
-safe = false
-dry_run_supported = false
+safe = true
+dry_run_supported = true
 
 [[controls."OSPS-AC-04.01".remediation.handlers]]
-handler = "manual"
-steps = [
-    "Add a top-level 'permissions: {}' block to each workflow in .github/workflows/",
-    "Grant only the specific permissions each job needs (e.g., contents: read)",
-    "See GitHub's documentation for available permission scopes",
-]
-docs_url = "https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs"
-context_hints = ["ci.provider"]
+handler = "yaml_inject"
+files = ".github/workflows/*.yml"
+key = "permissions"
+value = "{}"
+insert_after = "on"
+
+[[controls."OSPS-AC-04.01".remediation.handlers]]
+handler = "yaml_inject"
+files = ".github/workflows/*.yaml"
+key = "permissions"
+value = "{}"
+insert_after = "on"
 
 # =============================================================================
 # Level 2 Controls - Governance (GV)
@@ -2704,7 +2713,7 @@ handler = "exec"
 command = ["gh", "release", "list", "--json", "tagName,assets", "--limit", "5"]
 pass_exit_codes = [0]
 output_format = "json"
-expr = 'size(output.json) > 0 && size(output.json[0].assets) > 0'
+expr = 'output.json.exists(r, size(r.assets) > 0)'
 timeout = 30
 
 [[controls."OSPS-BR-02.02".passes]]
@@ -3209,7 +3218,19 @@ steps = [
 [controls."OSPS-VM-05.02".remediation]
 safe = true
 dry_run_supported = true
+strategy = "first_match"
 
+# When Kusari Inspector is installed, it handles SCA — no workflow needed
+[[controls."OSPS-VM-05.02".remediation.handlers]]
+handler = "manual"
+when = { "scan.app_kusari_inspector" = "true" }
+steps = [
+    "Kusari Inspector is installed and provides SCA scanning",
+    "Verify Kusari Inspector is configured for this repository at https://console.us.kusari.cloud/",
+    "No additional workflow file is needed — Kusari Inspector runs as a GitHub App",
+]
+
+# Default: create a dependency-review workflow when no SCA tool is detected
 [[controls."OSPS-VM-05.02".remediation.handlers]]
 handler = "file_create"
 path = ".github/workflows/sca.yml"
@@ -3381,7 +3402,7 @@ handler = "pattern"
 files = [".github/workflows/*.yml", ".github/workflows/*.yaml"]
 
 [controls."OSPS-VM-06.02".passes.pattern.patterns]
-sast_tool = "(codeql|semgrep|sonar|bandit|gosec|brakeman)"
+sast_tool = "(codeql|semgrep|sonar|bandit|gosec|brakeman|kusari)"
 
 [[controls."OSPS-VM-06.02".passes]]
 handler = "manual"
@@ -3394,7 +3415,19 @@ steps = [
 [controls."OSPS-VM-06.02".remediation]
 safe = true
 dry_run_supported = true
+strategy = "first_match"
 
+# When Kusari Inspector is installed, it handles SAST — no workflow needed
+[[controls."OSPS-VM-06.02".remediation.handlers]]
+handler = "manual"
+when = { "scan.app_kusari_inspector" = "true" }
+steps = [
+    "Kusari Inspector is installed and provides SAST scanning",
+    "Verify Kusari Inspector is configured for this repository at https://console.us.kusari.cloud/",
+    "No additional workflow file is needed — Kusari Inspector runs as a GitHub App",
+]
+
+# Default: create a CodeQL workflow when no SAST tool is detected
 [[controls."OSPS-VM-06.02".remediation.handlers]]
 handler = "file_create"
 path = ".github/workflows/sast.yml"

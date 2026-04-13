@@ -708,6 +708,15 @@ def _build_context_question(req) -> dict:
     """
     auto_detect_enabled = getattr(req.definition, "auto_detect", False)
 
+    # When auto-detection ran but found nothing, use the more informative hint
+    effective_hint = req.definition.hint
+    if (
+        auto_detect_enabled
+        and req.current_value is None
+        and getattr(req.definition, "no_detect_hint", None)
+    ):
+        effective_hint = req.definition.no_detect_hint
+
     question: dict = {
         "key": req.key,
         "priority": req.priority,
@@ -752,8 +761,8 @@ def _build_context_question(req) -> dict:
         question["instruction"] = (
             "Present ONLY these options. Do NOT add other options."
         )
-        if req.definition.hint:
-            question["hint"] = req.definition.hint
+        if effective_hint:
+            question["hint"] = effective_hint
         question["command_template"] = (
             f'confirm_project_context({req.key}="<selected_value>")'
         )
@@ -764,8 +773,8 @@ def _build_context_question(req) -> dict:
         question["question"] = req.definition.prompt
         question["options"] = ["true", "false"]
         question["instruction"] = "Ask yes or no. Do NOT add other options."
-        if req.definition.hint:
-            question["hint"] = req.definition.hint
+        if effective_hint:
+            question["hint"] = effective_hint
         question["command_template"] = (
             f"confirm_project_context({req.key}=<true_or_false>)"
         )
@@ -780,8 +789,8 @@ def _build_context_question(req) -> dict:
             "owner, git config, or any other source. "
             "Present a blank text input only."
         )
-        if req.definition.hint:
-            question["hint"] = req.definition.hint
+        if effective_hint:
+            question["hint"] = effective_hint
         if req.definition.examples:
             question["example_format"] = req.definition.examples
         question["command_template"] = (
@@ -1036,6 +1045,7 @@ def remediate_audit_findings(
     branch_name: str | None = None,
     auto_commit: bool = False,
     create_pr: bool = False,
+    enhance_with_llm: bool = False,
 ) -> str:
     """
     Apply automated remediations for failed audit controls.
@@ -1062,6 +1072,9 @@ def remediate_audit_findings(
         branch_name: Create/checkout this branch before applying remediations
         auto_commit: Automatically commit after applying remediations
         create_pr: Create a pull request after committing
+        enhance_with_llm: If True, enrich complex documents (ARCHITECTURE.md,
+            threat model) with LLM-generated descriptions after deterministic
+            generation.  Default False (opt-in).
 
     Returns:
         Summary of applied or planned remediations (with git workflow status if applicable)
@@ -1122,6 +1135,7 @@ def remediate_audit_findings(
             categories=categories or ["all"],
             dry_run=dry_run,
             profile=profile,
+            enhance_with_llm=enhance_with_llm,
         )
     except Exception as e:
         return f"❌ Error applying remediations: {e}"

@@ -20,12 +20,17 @@ Example:
     ```
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from jinja2 import Environment
 
 from darnit.config.framework_schema import (
     ProjectUpdateRemediationConfig,
@@ -93,14 +98,22 @@ class RemediationExecutor:
     Dispatches handler invocations from RemediationConfig.handlers through
     the sieve handler registry (file_create, exec, api_call, manual_steps, etc.).
 
-    Variable substitution is supported in templates and commands:
-    - $OWNER - Repository owner
-    - $REPO - Repository name
-    - $BRANCH - Default branch
-    - $PATH - Local repository path
-    - $YEAR - Current year
-    - $DATE - Current date (ISO format)
-    - $CONTROL - Control ID being remediated
+    Templates use Jinja2 with non-colliding delimiters (<< >> for variables,
+    <% %> for blocks) so that GitHub Actions ${{ }}, shell $VAR, and other
+    dollar-sign syntaxes pass through untouched.
+
+    Available template variables:
+    - << OWNER >> - Repository owner
+    - << REPO >> - Repository name
+    - << BRANCH >> - Default branch
+    - << PATH >> - Local repository path
+    - << YEAR >> - Current year
+    - << DATE >> - Current date (ISO format)
+    - << CONTROL >> - Control ID being remediated
+    - << context.KEY >> - Confirmed project context values
+    - << project.KEY >> - Values from .project/project.yaml
+    - << scan.KEY >> - Repo scanner results
+    - << scan.KEY | default('fallback') >> - With Jinja2 default filter
     """
 
     def __init__(
@@ -112,6 +125,7 @@ class RemediationExecutor:
         templates: dict[str, TemplateConfig] | None = None,
         context_values: dict[str, Any] | None = None,
         project_values: dict[str, Any] | None = None,
+        scan_values: dict[str, Any] | None = None,
         framework_path: str | None = None,
     ):
         """Initialize the executor.
@@ -124,6 +138,9 @@ class RemediationExecutor:
             templates: Template definitions from framework config
             context_values: Confirmed context values for ${context.*} substitution
             project_values: Flattened .project/project.yaml for ${project.*} substitution
+            scan_values: Repo scan values for ${scan.*} substitution.
+                Populated by the implementation's repo scanner with detected
+                languages, CI tools, directory structure, etc.
             framework_path: Absolute path to the framework TOML file.
                 Template ``file`` references are resolved relative to this
                 file's directory.  Falls back to ``local_path`` when None.
@@ -134,6 +151,7 @@ class RemediationExecutor:
         self.default_branch = default_branch
         self._context_values = context_values or {}
         self._project_values = project_values or {}
+        self._scan_values = scan_values or {}
 
         # Auto-detect owner/repo if not provided
         if not owner or not repo:
@@ -145,80 +163,127 @@ class RemediationExecutor:
         self.owner = owner
         self.repo = repo
 
-    def _get_substitutions(self, control_id: str) -> dict[str, str]:
-        """Get variable substitutions for templates and commands.
+    def _get_template_context(self, control_id: str) -> dict[str, Any]:
+        """Build the Jinja2 template context dictionary.
 
-        Includes standard $VAR substitutions and ${context.*} / ${project.*}
-        references resolved from confirmed context and project config.
+        Returns a flat dict with all variable namespaces:
+        - Top-level: OWNER, REPO, BRANCH, PATH, YEAR, DATE, CONTROL
+        - context.*: From confirmed context values
+        - project.*: From .project/project.yaml
+        - scan.*: From repo scanner results
+
+        Jinja2 templates access these as e.g. ``<< REPO >>`` or
+        ``<< context.maintainers >>``.
         """
         now = datetime.now()
-        subs = {
-            "$OWNER": self.owner or "",
-            "$REPO": self.repo or "",
-            "$BRANCH": self.default_branch,
-            "$PATH": self.local_path,
-            "$YEAR": str(now.year),
-            "$DATE": now.strftime("%Y-%m-%d"),
-            "$CONTROL": control_id,
+        ctx: dict[str, Any] = {
+            "OWNER": self.owner or "",
+            "REPO": self.repo or "",
+            "BRANCH": self.default_branch,
+            "PATH": self.local_path,
+            "YEAR": str(now.year),
+            "DATE": now.strftime("%Y-%m-%d"),
+            "CONTROL": control_id,
         }
 
-        # Add ${context.*} from confirmed context values
+        # Build nested context/project/scan namespaces
+        context_ns: dict[str, str] = {}
         if self._context_values:
             for key, value in self._context_values.items():
                 if isinstance(value, str):
-                    subs[f"${{context.{key}}}"] = value
+                    context_ns[key] = value
                 elif isinstance(value, list):
-                    subs[f"${{context.{key}}}"] = " ".join(str(v) for v in value)
+                    context_ns[key] = " ".join(str(v) for v in value)
                 elif value is not None:
-                    subs[f"${{context.{key}}}"] = str(value)
+                    context_ns[key] = str(value)
+        ctx["context"] = context_ns
 
-        # Add ${project.*} from .project/project.yaml
+        project_ns: dict[str, str] = {}
         if self._project_values:
             for key, value in self._project_values.items():
                 if isinstance(value, str):
-                    subs[f"${{project.{key}}}"] = value
+                    project_ns[key] = value
                 elif value is not None:
-                    subs[f"${{project.{key}}}"] = str(value)
+                    project_ns[key] = str(value)
+        ctx["project"] = project_ns
 
-        return subs
+        scan_ns: dict[str, str] = {}
+        if self._scan_values:
+            for key, value in self._scan_values.items():
+                # Strip "scan." prefix if present — the namespace is implicit
+                bare_key = key.removeprefix("scan.")
+                if isinstance(value, str) and value:
+                    scan_ns[bare_key] = value
+        ctx["scan"] = scan_ns
+
+        return ctx
+
+    def _get_jinja_env(self) -> Environment:
+        """Create a Jinja2 environment with non-colliding delimiters.
+
+        Uses ``<< >>`` for variables and ``<% %>`` for blocks so that
+        GitHub Actions ``${{ }}`` and shell ``$VAR`` pass through untouched.
+        """
+        import jinja2
+
+        return jinja2.Environment(
+            variable_start_string="<<",
+            variable_end_string=">>",
+            block_start_string="<%",
+            block_end_string="%>",
+            comment_start_string="<#",
+            comment_end_string="#>",
+            keep_trailing_newline=True,
+            undefined=jinja2.Undefined,  # Missing vars render as empty string
+        )
 
     def _substitute(self, text: str, control_id: str) -> str:
-        """Substitute variables in text.
+        """Render template text using Jinja2.
 
-        Handles both $VAR and ${...} patterns.
-        Unresolved ${...} references are replaced with empty string.
+        Uses ``<< var >>`` delimiters for variables and ``<% %>`` for blocks,
+        avoiding collisions with GitHub Actions ``${{ }}``, shell ``$VAR``,
+        and other dollar-sign syntaxes.
         """
-        import re
-
-        substitutions = self._get_substitutions(control_id)
-        result = text
-
-        # First: resolve ${...} patterns (more specific, match first)
-        for var, value in substitutions.items():
-            if var.startswith("${") and value:
-                result = result.replace(var, value)
-
-        # Replace any remaining unresolved ${...} with empty string
-        result = re.sub(r"\$\{[^}]+\}", "", result)
-
-        # Then: resolve standard $VAR patterns
-        for var, value in substitutions.items():
-            if not var.startswith("${") and value:
-                result = result.replace(var, value)
-
-        return result
+        env = self._get_jinja_env()
+        template = env.from_string(text)
+        ctx = self._get_template_context(control_id)
+        return template.render(ctx)
 
     def _substitute_command(self, command: list[str], control_id: str) -> list[str]:
-        """Substitute variables in command list."""
-        substitutions = self._get_substitutions(control_id)
+        """Substitute variables in command list using Jinja2."""
+        env = self._get_jinja_env()
+        ctx = self._get_template_context(control_id)
         result = []
         for arg in command:
-            modified = arg
-            for var, value in substitutions.items():
-                if var in modified and value:
-                    modified = modified.replace(var, value)
-            result.append(modified)
+            template = env.from_string(arg)
+            result.append(template.render(ctx))
         return result
+
+    # Keep legacy method for backward compatibility with _get_substitutions
+    # callers (e.g., orchestrator manual steps)
+    def _get_substitutions(self, control_id: str) -> dict[str, str]:
+        """Get variable substitutions as a flat $VAR / ${var} dict.
+
+        This is a compatibility shim for code that still uses string
+        replacement (e.g., manual remediation steps in the orchestrator).
+        New code should use _get_template_context() + Jinja2 instead.
+        """
+        ctx = self._get_template_context(control_id)
+        subs: dict[str, str] = {}
+
+        # Top-level vars as $VAR
+        for key in ("OWNER", "REPO", "BRANCH", "PATH", "YEAR", "DATE", "CONTROL"):
+            subs[f"${key}"] = ctx.get(key, "")
+
+        # Namespace vars as ${namespace.key}
+        for ns in ("context", "project", "scan"):
+            ns_dict = ctx.get(ns, {})
+            if isinstance(ns_dict, dict):
+                for key, value in ns_dict.items():
+                    if value:
+                        subs[f"${{{ns}.{key}}}"] = value
+
+        return subs
 
     def _get_template_content(self, template_name: str) -> str | None:
         """Get content from a template by name.
@@ -387,6 +452,9 @@ class RemediationExecutor:
         # Assemble flat context for when-clause evaluation
         when_context: dict[str, Any] = dict(self._project_values)
         when_context.update(self._context_values)
+        # Include scan values so when-clauses can match on detected CI tools
+        # (e.g., scan.ci_sast_tools, scan.ci_sca_tools)
+        when_context.update(self._scan_values)
 
         results: list[dict[str, Any]] = []
         all_success = True
