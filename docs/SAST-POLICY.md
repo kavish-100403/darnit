@@ -17,7 +17,7 @@
 ## Tools
 
 SAST scanning is performed by Kusari Inspector. See
-[`.github/workflows/sast.yml`](../.github/workflows/sast.yml) for configuration.
+the Kusari Inspector GitHub App integration for configuration.
 
 ## Exception Process
 

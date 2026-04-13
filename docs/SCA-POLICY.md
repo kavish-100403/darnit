@@ -17,7 +17,7 @@
 
 ## Remediation Process
 
-1. Automated alerts from Kusari Inspector — see [`.github/workflows/sca.yml`](../.github/workflows/sca.yml) for configuration
+1. Automated alerts from Kusari Inspector via the GitHub App integration
 2. Triage by maintainers to confirm applicability
 3. Apply patch, upgrade, or document as not affected (VEX)
 4. Verify fix does not introduce regressions

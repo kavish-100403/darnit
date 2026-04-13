@@ -27,4 +27,4 @@ When a vulnerability is discovered in a dependency:
 ## Tools
 
 - [Dependabot](../.github/dependabot.yml) for automated dependency updates
-- [SCA workflow](../.github/workflows/sca.yml) for pull request dependency review
+- Kusari Inspector GitHub App for pull request dependency review

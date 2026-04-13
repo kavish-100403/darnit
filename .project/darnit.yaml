@@ -18,7 +18,7 @@ context:
   platform: github
   maintainers:
   - '@mlieberman85'
-  security_contact: security@example.com
+  security_contact: ''
   governance_model: corporate
 quality: {}
 artifacts: {}
